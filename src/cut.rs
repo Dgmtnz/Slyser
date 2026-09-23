@@ -9,6 +9,10 @@ pub struct CutResult {
     pub positive_mesh: Mesh,
     /// Half-space mesh where (p - P0) . n <= 0
     pub negative_mesh: Mesh,
+    /// Triangles of the positive half body excluding planar cap
+    pub positive_body: Vec<Triangle>,
+    /// Triangles of the negative half body excluding planar cap
+    pub negative_body: Vec<Triangle>,
     /// Plane used for the cut
     pub cut_plane: Plane,
     /// Surface area of the cross-section / cap in mm²
@@ -17,6 +21,8 @@ pub struct CutResult {
     pub cut_polygons_2d: Vec<Vec<Vec2>>,
     /// Unsimplified 2D closed boundary loops matching the exact sliced mesh vertices
     pub cut_loops_2d: Vec<Vec<Vec2>>,
+    /// Unsimplified 3D closed boundary loops matching the exact sliced mesh vertices
+    pub cut_loops_3d: Vec<Vec<Vec3>>,
     /// Tangent and bitangent orthonormal vectors defining the 2D local plane coordinate system (u_axis, v_axis)
     pub plane_basis: (Vec3, Vec3),
 }
@@ -428,9 +434,13 @@ pub fn slice_mesh_by_plane(mesh: &Mesh, plane: &Plane) -> Result<CutResult, Stri
         }
     }
 
+    let positive_body = pos_tris.clone();
+    let negative_body = neg_tris.clone();
+
     let mut total_cut_area = 0.0f32;
     let mut cut_polygons_2d: Vec<Vec<Vec2>> = Vec::new();
     let mut cut_loops_2d: Vec<Vec<Vec2>> = Vec::new();
+    let mut cut_loops_3d: Vec<Vec<Vec3>> = Vec::new();
 
     for mut loop_3d in loops {
         let n = loop_3d.len();
@@ -461,6 +471,7 @@ pub fn slice_mesh_by_plane(mesh: &Mesh, plane: &Plane) -> Result<CutResult, Stri
         let simplified_2d = simplify_collinear_2d(&loop_2d);
         cut_polygons_2d.push(simplified_2d);
         cut_loops_2d.push(loop_2d.clone());
+        cut_loops_3d.push(loop_3d.clone());
 
         // Triangulate cap
 
@@ -499,10 +510,13 @@ pub fn slice_mesh_by_plane(mesh: &Mesh, plane: &Plane) -> Result<CutResult, Stri
     Ok(CutResult {
         positive_mesh,
         negative_mesh,
+        positive_body,
+        negative_body,
         cut_plane: normalized_plane,
         cut_area: total_cut_area,
         cut_polygons_2d,
         cut_loops_2d,
+        cut_loops_3d,
         plane_basis: (u_axis, v_axis),
     })
 }

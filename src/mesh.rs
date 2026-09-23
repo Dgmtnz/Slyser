@@ -469,5 +469,154 @@ impl Mesh {
     pub fn is_watertight(&self) -> bool {
         self.is_closed()
     }
+
+    /// Partitions the mesh into separate connected surface components.
+    /// Triangles sharing vertices (quantized with 1e-4 mm tolerance) are grouped together.
+    /// Components are returned sorted in descending order of total volume.
+    pub fn connected_components(&self) -> Vec<Mesh> {
+        if self.triangles.is_empty() {
+            return Vec::new();
+        }
+
+        let n = self.triangles.len();
+        let mut dsu = DisjointSet::new(n);
+        let mut vertex_to_tri: std::collections::HashMap<(i64, i64, i64), usize> =
+            std::collections::HashMap::with_capacity(n * 3);
+
+        let quantize = |v: Vec3| -> (i64, i64, i64) {
+            (
+                (v.x * 1e4).round() as i64,
+                (v.y * 1e4).round() as i64,
+                (v.z * 1e4).round() as i64,
+            )
+        };
+
+        for (i, tri) in self.triangles.iter().enumerate() {
+            for v in &tri.vertices {
+                let key = quantize(*v);
+                match vertex_to_tri.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        dsu.union(i, *entry.get());
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(i);
+                    }
+                }
+            }
+        }
+
+        let mut groups: std::collections::HashMap<usize, Vec<Triangle>> =
+            std::collections::HashMap::new();
+        for (i, tri) in self.triangles.iter().enumerate() {
+            let root = dsu.find(i);
+            groups.entry(root).or_default().push(*tri);
+        }
+
+        let mut components: Vec<Mesh> = groups.into_values().map(Mesh::new).collect();
+        components.sort_by(|a, b| {
+            b.total_volume()
+                .total_cmp(&a.total_volume())
+                .then_with(|| b.triangles.len().cmp(&a.triangles.len()))
+        });
+
+        components
+    }
+
+    /// Returns the number of disconnected components in the mesh.
+    pub fn connected_components_count(&self) -> usize {
+        if self.triangles.is_empty() {
+            return 0;
+        }
+
+        let n = self.triangles.len();
+        let mut dsu = DisjointSet::new(n);
+        let mut vertex_to_tri: std::collections::HashMap<(i64, i64, i64), usize> =
+            std::collections::HashMap::with_capacity(n * 3);
+
+        let quantize = |v: Vec3| -> (i64, i64, i64) {
+            (
+                (v.x * 1e4).round() as i64,
+                (v.y * 1e4).round() as i64,
+                (v.z * 1e4).round() as i64,
+            )
+        };
+
+        for (i, tri) in self.triangles.iter().enumerate() {
+            for v in &tri.vertices {
+                let key = quantize(*v);
+                match vertex_to_tri.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        dsu.union(i, *entry.get());
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(i);
+                    }
+                }
+            }
+        }
+
+        let mut roots = std::collections::HashSet::new();
+        for i in 0..n {
+            roots.insert(dsu.find(i));
+        }
+        roots.len()
+    }
+
+    /// Returns true if the mesh is a single contiguous solid body (exactly 1 connected component).
+    #[inline]
+    pub fn is_contiguous(&self) -> bool {
+        self.connected_components_count() == 1
+    }
+
+    /// Returns the largest connected component by volume, or empty mesh if empty.
+    pub fn largest_connected_component(&self) -> Mesh {
+        let mut comps = self.connected_components();
+        if comps.is_empty() {
+            Mesh::empty()
+        } else {
+            comps.swap_remove(0)
+        }
+    }
+}
+
+struct DisjointSet {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl DisjointSet {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
+        }
+        while self.parent[x] != root {
+            let next = self.parent[x];
+            self.parent[x] = root;
+            x = next;
+        }
+        root
+    }
+
+    fn union(&mut self, x: usize, y: usize) {
+        let mut root_x = self.find(x);
+        let mut root_y = self.find(y);
+        if root_x != root_y {
+            if self.rank[root_x] < self.rank[root_y] {
+                std::mem::swap(&mut root_x, &mut root_y);
+            }
+            self.parent[root_y] = root_x;
+            if self.rank[root_x] == self.rank[root_y] {
+                self.rank[root_x] += 1;
+            }
+        }
+    }
 }
 

@@ -118,6 +118,12 @@ enum Commands {
         /// XY clearance per side for FDM fit in mm (default: 0.2)
         #[arg(long, default_value_t = 0.2)]
         pin_clearance: f32,
+        /// Allow cuts that split pieces into disjoint/floating islands
+        #[arg(long, default_value_t = false)]
+        allow_disjoint: bool,
+        /// Minimum pin size in mm for adaptive sizing (default: 1.5)
+        #[arg(long, default_value_t = 1.5)]
+        pin_min_size: f32,
     },
 }
 
@@ -152,6 +158,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Total Surface:   {:.3} mm²", mesh.total_surface_area());
             println!("Total Volume:    {:.3} mm³", mesh.total_volume());
             println!("Center of Mass:  [{:.3}, {:.3}, {:.3}]", com.x, com.y, com.z);
+            println!("Is Closed:       {}", mesh.is_closed());
+            println!("Components:      {}", mesh.connected_components_count());
         }
         Some(Commands::Analyze {
             input,
@@ -272,6 +280,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     depth: pin_depth,
                     clearance: pin_clearance,
                     edge_margin: 2.0,
+                    adaptive: true,
+                    min_size: 1.5,
                 };
                 let (pos_sock, neg_sock, pins_list) =
                     apply_female_sockets_and_generate_pins(&result, &config);
@@ -327,6 +337,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pin_size,
             pin_depth,
             pin_clearance,
+            allow_disjoint,
+            pin_min_size,
         }) => {
             println!("Reading STL: {}", input.display());
             let mesh = read_stl_file(&input)?;
@@ -337,6 +349,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     depth: pin_depth,
                     clearance: pin_clearance,
                     edge_margin: 2.0,
+                    adaptive: true,
+                    min_size: pin_min_size,
                 })
             } else {
                 None
@@ -350,6 +364,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 weight_cut_area: 0.001,
                 min_piece_volume_ratio: 0.02,
                 num_candidate_planes: 20,
+                enforce_contiguous: !allow_disjoint,
+                pin_min_size,
             };
 
             let start = std::time::Instant::now();
@@ -366,7 +382,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Support Volume Reduction:    {:.1}%", result.total_reduction_pct);
             println!("Cuts Made:                   {}", result.cuts_made);
             println!("Pieces Generated:            {}", result.pieces.len());
+            let all_contiguous = result.pieces.iter().all(|p| p.mesh.is_contiguous());
+            println!("Contiguous Solid:            {}", if all_contiguous { "true" } else { "false" });
             println!("Square Pins Generated:       {}", result.pins.len());
+            if let Some(pin_sz) = result.pin_size_used {
+                println!("Pin Size:                    {:.1} mm", pin_sz);
+            }
             println!("Execution Time:              {:.2?}", elapsed);
             println!("--------------------------------------------------------------------------------");
             println!("Piece Breakdown:");

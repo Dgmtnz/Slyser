@@ -13,6 +13,7 @@ fn test_square_pin_mesh_dimensions_and_watertightness() {
         depth: 5.0,
         clearance: 0.2,
         edge_margin: 2.0,
+        ..Default::default()
     };
 
     let pin = generate_square_pin(&config);
@@ -302,6 +303,7 @@ fn test_diagonal_cut_with_sockets() {
         depth: 4.0,
         clearance: 0.15,
         edge_margin: 2.5,
+        ..Default::default()
     };
 
     let placements = find_pin_placements(&cut, &config);

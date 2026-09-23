@@ -23,6 +23,10 @@ pub struct OptimizerConfig {
     pub min_piece_volume_ratio: f32,
     /// Sampling resolution for candidate planes along axes (default: 20).
     pub num_candidate_planes: usize,
+    /// Enforce single contiguous solid guarantee on all pieces (default: true).
+    pub enforce_contiguous: bool,
+    /// Minimum allowed square pin size in mm for adaptive pin sizing (default: 1.5).
+    pub pin_min_size: f32,
 }
 
 impl Default for OptimizerConfig {
@@ -35,6 +39,8 @@ impl Default for OptimizerConfig {
             weight_cut_area: 0.001,
             min_piece_volume_ratio: 0.02,
             num_candidate_planes: 20,
+            enforce_contiguous: true,
+            pin_min_size: 1.5,
         }
     }
 }
@@ -60,6 +66,18 @@ impl OptimizerConfig {
     /// Enables square alignment pins with the given configuration.
     pub fn with_pins(mut self, pin_config: PinConfig) -> Self {
         self.pin_config = Some(pin_config);
+        self
+    }
+
+    /// Sets whether to enforce that every resulting piece is a single contiguous solid.
+    pub fn with_enforce_contiguous(mut self, enforce: bool) -> Self {
+        self.enforce_contiguous = enforce;
+        self
+    }
+
+    /// Sets the minimum pin size in mm for adaptive sizing.
+    pub fn with_pin_min_size(mut self, min_size: f32) -> Self {
+        self.pin_min_size = min_size;
         self
     }
 }
@@ -94,6 +112,8 @@ pub struct OptimizationResult {
     pub total_reduction_pct: f32,
     /// Total computation time in milliseconds.
     pub computation_time_ms: f64,
+    /// Size of square alignment pins used in mm, if pins were generated.
+    pub pin_size_used: Option<f32>,
 }
 
 /// Performs Jacobi eigenvalue decomposition on a real symmetric 3x3 matrix.
@@ -709,8 +729,6 @@ impl CandidatePlaneGenerator {
 struct CandidateEvaluation {
     plane: Plane,
     score: f32,
-    pos_opt: OptimalOrientation,
-    neg_opt: OptimalOrientation,
 }
 
 /// Evaluates a single candidate plane on a mesh.
@@ -734,6 +752,22 @@ fn evaluate_candidate_plane(
         return None;
     }
 
+    if config.enforce_contiguous {
+        let is_multi_body = |m: &Mesh| -> bool {
+            let comps = m.connected_components();
+            if comps.len() <= 1 {
+                return false;
+            }
+            let threshold = 0.03 * m.total_volume();
+            let significant_count = comps.iter().filter(|c| c.total_volume() > threshold).count();
+            significant_count > 1
+        };
+
+        if is_multi_body(&cut_result.positive_mesh) || is_multi_body(&cut_result.negative_mesh) {
+            return None;
+        }
+    }
+
     let pos_opt = find_optimal_orientation(&cut_result.positive_mesh, &config.support_config);
     let neg_opt = find_optimal_orientation(&cut_result.negative_mesh, &config.support_config);
 
@@ -744,9 +778,40 @@ fn evaluate_candidate_plane(
     Some(CandidateEvaluation {
         plane: *plane,
         score,
-        pos_opt,
-        neg_opt,
     })
+}
+
+/// Enforces single contiguous solid guarantee by processing connected components.
+/// Keeps the dominant primary component, discards tiny floating debris (< 3% volume),
+/// and collects significant secondary components (>= 5% volume) if pieces budget allows.
+fn extract_contiguous_components(mesh: Mesh, max_additional: usize) -> (Mesh, Vec<Mesh>) {
+    let comps = mesh.connected_components();
+    if comps.is_empty() {
+        return (mesh, Vec::new());
+    }
+    if comps.len() == 1 {
+        return (comps.into_iter().next().unwrap(), Vec::new());
+    }
+
+    let total_vol: f32 = comps.iter().map(|c| c.total_volume()).sum();
+    let primary = comps[0].clone();
+    let mut promoted = Vec::new();
+
+    let mut remaining_budget = max_additional;
+    for c in comps.into_iter().skip(1) {
+        let vol_ratio = if total_vol > 1e-6 {
+            c.total_volume() / total_vol
+        } else {
+            0.0
+        };
+
+        if vol_ratio >= 0.05 && remaining_budget > 0 {
+            promoted.push(c);
+            remaining_budget -= 1;
+        }
+    }
+
+    (primary, promoted)
 }
 
 /// Evaluates candidate cut planes in parallel and finds the optimal partition of the mesh.
@@ -762,6 +827,7 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
             total_support_volume: 0.0,
             total_reduction_pct: 0.0,
             computation_time_ms: 0.0,
+            pin_size_used: None,
         };
     }
 
@@ -769,7 +835,8 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
 
     // If already requires 0 support or max_pieces <= 1, do not cut
     if orig_metrics.estimated_support_volume <= 1e-4 || config.max_pieces <= 1 {
-        let optimal = find_optimal_orientation(mesh, &config.support_config);
+        let (clean_mesh, _) = extract_contiguous_components(mesh.clone(), 0);
+        let optimal = find_optimal_orientation(&clean_mesh, &config.support_config);
         let final_support = optimal.metrics.estimated_support_volume;
         let orig_sup = orig_metrics.estimated_support_volume;
         let reduction = if orig_sup > 1e-6 {
@@ -791,6 +858,7 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
             total_support_volume: final_support,
             total_reduction_pct: reduction,
             computation_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+            pin_size_used: None,
         };
     }
 
@@ -801,12 +869,13 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
         can_cut: bool,
     }
 
+    let (initial_clean, _) = extract_contiguous_components(mesh.clone(), 0);
     let mut pieces_state = vec![PieceCandidate {
-        mesh: mesh.clone(),
+        mesh: initial_clean.clone(),
         opt: OptimalOrientation {
             rotation: glam::Quat::IDENTITY,
             translation: Vec3::ZERO,
-            mesh: mesh.clone(),
+            mesh: initial_clean,
             metrics: orig_metrics.clone(),
             contact_area: 0.0,
             is_stable: true,
@@ -852,53 +921,51 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
         match best_candidate {
             Some(best) if best.score < uncut_score - 1e-4 => {
                 cuts_made += 1;
-                if let Some(ref pin_cfg) = config.pin_config {
+                let (raw_pos, raw_neg) = if let Some(ref pin_cfg) = config.pin_config {
                     if let Ok(cut_res) = slice_mesh_by_plane(&target_mesh, &best.plane) {
+                        let mut adaptive_pin_cfg = *pin_cfg;
+                        adaptive_pin_cfg.adaptive = true;
+                        adaptive_pin_cfg.min_size = config.pin_min_size;
                         let (pos_s, neg_s, mut p_meshes) =
-                            apply_female_sockets_and_generate_pins(&cut_res, pin_cfg);
+                            apply_female_sockets_and_generate_pins(&cut_res, &adaptive_pin_cfg);
                         all_pins.append(&mut p_meshes);
-
-                        let p_opt = find_optimal_orientation(&pos_s, &config.support_config);
-                        let n_opt = find_optimal_orientation(&neg_s, &config.support_config);
-
-                        let p_sup = p_opt.metrics.estimated_support_volume;
-                        let n_sup = n_opt.metrics.estimated_support_volume;
-
-                        pieces_state.remove(piece_idx);
-                        pieces_state.push(PieceCandidate {
-                            mesh: pos_s,
-                            opt: p_opt,
-                            current_support: p_sup,
-                            can_cut: p_sup > 1e-3,
-                        });
-                        pieces_state.push(PieceCandidate {
-                            mesh: neg_s,
-                            opt: n_opt,
-                            current_support: n_sup,
-                            can_cut: n_sup > 1e-3,
-                        });
+                        (pos_s, neg_s)
                     } else {
                         pieces_state[piece_idx].can_cut = false;
+                        continue;
                     }
                 } else if let Ok(cut_res) = slice_mesh_by_plane(&target_mesh, &best.plane) {
-                    let p_sup = best.pos_opt.metrics.estimated_support_volume;
-                    let n_sup = best.neg_opt.metrics.estimated_support_volume;
-
-                    pieces_state.remove(piece_idx);
-                    pieces_state.push(PieceCandidate {
-                        mesh: cut_res.positive_mesh,
-                        opt: best.pos_opt,
-                        current_support: p_sup,
-                        can_cut: p_sup > 1e-3,
-                    });
-                    pieces_state.push(PieceCandidate {
-                        mesh: cut_res.negative_mesh,
-                        opt: best.neg_opt,
-                        current_support: n_sup,
-                        can_cut: n_sup > 1e-3,
-                    });
+                    (cut_res.positive_mesh, cut_res.negative_mesh)
                 } else {
                     pieces_state[piece_idx].can_cut = false;
+                    continue;
+                };
+
+                pieces_state.remove(piece_idx);
+
+                let current_len = pieces_state.len();
+                let budget = config.max_pieces.saturating_sub(current_len + 2);
+                let (pos_primary, pos_promoted) = extract_contiguous_components(raw_pos, budget);
+                let budget = config
+                    .max_pieces
+                    .saturating_sub(current_len + 2 + pos_promoted.len());
+                let (neg_primary, neg_promoted) = extract_contiguous_components(raw_neg, budget);
+
+                let mut to_add = Vec::new();
+                to_add.push(pos_primary);
+                to_add.extend(pos_promoted);
+                to_add.push(neg_primary);
+                to_add.extend(neg_promoted);
+
+                for m in to_add {
+                    let opt = find_optimal_orientation(&m, &config.support_config);
+                    let sup = opt.metrics.estimated_support_volume;
+                    pieces_state.push(PieceCandidate {
+                        mesh: m,
+                        opt,
+                        current_support: sup,
+                        can_cut: sup > 1e-3,
+                    });
                 }
             }
             _ => {
@@ -908,7 +975,8 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
     }
 
     if cuts_made == 0 {
-        let optimal = find_optimal_orientation(mesh, &config.support_config);
+        let (clean_mesh, _) = extract_contiguous_components(mesh.clone(), 0);
+        let optimal = find_optimal_orientation(&clean_mesh, &config.support_config);
         let final_support = optimal.metrics.estimated_support_volume;
         let orig_sup = orig_metrics.estimated_support_volume;
         let reduction = if orig_sup > 1e-6 {
@@ -930,6 +998,7 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
             total_support_volume: final_support,
             total_reduction_pct: reduction,
             computation_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+            pin_size_used: None,
         }
     } else {
         let mut final_pieces = Vec::with_capacity(pieces_state.len());
@@ -952,6 +1021,8 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
             0.0
         };
 
+        let pin_size_used = all_pins.first().map(|p| p.aabb().size().x);
+
         OptimizationResult {
             original_metrics: orig_metrics,
             pieces: final_pieces,
@@ -960,6 +1031,7 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
             total_support_volume,
             total_reduction_pct: reduction,
             computation_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+            pin_size_used,
         }
     }
 }

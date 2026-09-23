@@ -10,6 +10,7 @@
 
 | **5** | Optimizador inteligente de particiones (Pareto) | Completada | Heurísticas multiescala (overhangs, cuellos de botella, PCA, offsets), exploración paralela con Rayon en 16 hilos, reducción 100% de soporte en T-bracket. 6 tests pasando. |
 | **6** | CLI completa, estadísticas y validación end-to-end | Completada | Subcomando `partition` con flags completas, reporte de métricas en terminal y exportación STL de piezas a Z=0 y clavijas. |
+| **7** | Garantía de piezas contiguas (sin fragmentos desconexos) y clavijas adaptativas | Completada | DSU de componentes conexas, restricción en cortes del optimizador y auto-escalado adaptativo de clavijas en secciones estrechas. 5 tests pasando. |
 
 ---
 
@@ -101,4 +102,16 @@
   - Desglose por pieza (dimensiones, volumen de soporte restante, área de contacto en cama).
   - Exportación automática a `<out_dir>/piece_*.stl` (planas en $Z=0$) y `<out_dir>/pin_*.stl`.
   - Verificación de ejecución completa end-to-end sobre modelos STL.
+
+### Iteración 7 (Completada)
+- **Fecha:** 2026-09-23
+- **Acciones:**
+  - Implementado algoritmo de clustering de componentes conexas en `Mesh` (`src/mesh.rs`) con cuantización de coordenadas a $10^{-4}$ mm y estructura Disjoint Set Union (DSU) (`connected_components`, `connected_components_count`, `is_contiguous`, `largest_connected_component`).
+  - Añadido generador `create_u_fork` en `src/primitives.rs` con subdivisión en cuadrícula para evitar uniones en T y garantizar manifold cerrado.
+  - Implementada restricción de contigüidad topológica en `src/optimizer.rs` (`enforce_contiguous: true`): descarte automático de planos de corte que fragmenten cualquier mitad en más de un componente significativo (> 0.5% del volumen).
+  - Implementado sistema de dimensionamiento adaptativo de clavijas en `src/pins.rs` (`PinConfig::adaptive`, `min_size`, `find_adaptive_pin_placements`, `apply_female_sockets_and_generate_pins_adaptive`): búsqueda sobre cuadrado inscrito con reducción automática de tamaño de pin (de 4.0 mm a 3.5, 3.0, 2.5, 2.0, 1.5 mm) y relajación perimetral de margen de borde (hasta 1.0 mm).
+  - Actualizado subcomando `partition` en CLI (`src/main.rs`) añadiendo flags `--allow-disjoint` y `--pin-min-size` con telemetría en terminal de contigüidad de piezas y tamaño de clavija utilizado.
+  - Creados 5 tests de integración en `tests/iteration_7.rs` cubriendo partición de cubos desconexos, componentes conexas de sólidos únicos, rechazo de planos fragmentadores en modelos en horquilla U, adaptación dimensional de clavijas en cuellos de 6x6 mm y cierre hermético (watertight) de todas las piezas y clavijas.
+  - Verificación exitosa: 54/54 tests aprobados en todas las suites (iteraciones 0 a 7), `cargo clippy --all-targets -- -D warnings` con 0 advertencias.
+
 

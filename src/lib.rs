@@ -21,10 +21,11 @@ pub use orient::{
     OrientationCandidate,
 };
 pub use pins::{
-    apply_female_sockets_and_generate_pins, find_pin_placements, generate_square_pin, PinConfig,
+    apply_female_sockets_and_generate_pins, apply_female_sockets_and_generate_pins_adaptive,
+    find_adaptive_pin_placements, find_pin_placements, generate_square_pin, PinConfig,
     PinPlacement,
 };
-pub use primitives::{create_box, create_cube, create_cube_centered, create_t_bracket};
+pub use primitives::{create_box, create_cube, create_cube_centered, create_t_bracket, create_u_fork};
 pub use stl::{read_stl, read_stl_file, write_stl_ascii, write_stl_binary, write_stl_file};
 pub use support::{analyze_support, is_overhang, SupportConfig, SupportMetrics};
 

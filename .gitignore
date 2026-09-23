@@ -1,1 +1,4 @@
 /target
+piece_*.stl
+pin_*.stl
+output/

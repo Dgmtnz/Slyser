@@ -60,3 +60,10 @@ Herramienta de alto rendimiento en Rust para partición inteligente de mallas ST
 - [x] Formateo de métricas en terminal (reducción de soporte en %, desglose dimensional y de soporte por pieza, tiempo de cómputo).
 - [x] Exportación de piezas listas para la cama de impresión a Z=0 con sus clavijas de ensamble.
 - [x] *Criterio de aceptación:* Ejecución completa fluida en CLI sobre modelos de prueba reales con tiempos de ejecución de milisegundos.
+
+### Iteración 7: Garantía de Piezas Contiguas (Sin Islas Desconexas) y Clavijas Adaptativas
+- [x] Detección y extracción de componentes conexas en malla (`connected_components`, `connected_components_count`, `is_contiguous`, `largest_connected_component`).
+- [x] Restricción de contigüidad en el optimizador: rechazar planos de corte que fragmenten cualquier mitad en múltiples piezas flotantes desconexas (`enforce_contiguous: true`, `--allow-disjoint`).
+- [x] Sistema adaptativo de clavijas: detección de cuadrado inscrito y reducción automática del tamaño de pin (4.0mm a 3.5, 3.0, 2.5, 2.0, 1.5mm) y relajación de margen (hasta 1.0mm) para secciones estrechas.
+- [x] Verificación de piezas cerradas herméticas (watertight), pruebas de integración y telemetría de contigüidad y tamaño de clavija.
+- [x] *Criterio de aceptación:* Cada pieza generada es 1 sólido contiguo único y cerrado, y las clavijas/cajeados se adaptan y generan con precisión dimensional.

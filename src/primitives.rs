@@ -332,3 +332,71 @@ pub fn create_t_bracket(stem: Vec3, overhang: Vec3) -> Mesh {
 
     Mesh::new(triangles)
 }
+
+/// Generates a solid U-shaped fork test model consisting of a base and two vertical prongs.
+///
+/// The model has a base spanning `[0..base_width, 0..depth, 0..base_height]`,
+/// a left prong spanning `[0..prong_width, 0..depth, base_height..total_height]`,
+/// and a right prong spanning `[base_width - prong_width..base_width, 0..depth, base_height..total_height]`.
+/// Guaranteed to be a watertight 2-manifold closed surface with no internal faces.
+pub fn create_u_fork(
+    base_width: f32,
+    depth: f32,
+    base_height: f32,
+    prong_width: f32,
+    total_height: f32,
+) -> Mesh {
+    let mut triangles = Vec::new();
+    let x0 = 0.0f32;
+    let x1 = prong_width;
+    let x2 = base_width - prong_width;
+    let x3 = base_width;
+    let y0 = 0.0f32;
+    let y1 = depth;
+    let z0 = 0.0f32;
+    let z1 = base_height;
+    let z2 = total_height;
+
+    // 1. Bottom faces at z0 facing -Z (subdivided along x1, x2 to match grid)
+    add_quad_down(&mut triangles, x0, x1, y0, y1, z0);
+    add_quad_down(&mut triangles, x1, x2, y0, y1, z0);
+    add_quad_down(&mut triangles, x2, x3, y0, y1, z0);
+
+    // 2. Base top face between prongs at z1 facing +Z
+    add_quad_up(&mut triangles, x1, x2, y0, y1, z1);
+
+    // 3. Prong top faces at z2 facing +Z
+    add_quad_up(&mut triangles, x0, x1, y0, y1, z2);
+    add_quad_up(&mut triangles, x2, x3, y0, y1, z2);
+
+    // 4. Outer left side at x0 facing -X (subdivided at z1)
+    add_quad_left(&mut triangles, y0, y1, z0, z1, x0);
+    add_quad_left(&mut triangles, y0, y1, z1, z2, x0);
+
+    // 5. Outer right side at x3 facing +X (subdivided at z1)
+    add_quad_right(&mut triangles, y0, y1, z0, z1, x3);
+    add_quad_right(&mut triangles, y0, y1, z1, z2, x3);
+
+    // 6. Inner left prong face at x1 facing +X
+    add_quad_right(&mut triangles, y0, y1, z1, z2, x1);
+
+    // 7. Inner right prong face at x2 facing -X
+    add_quad_left(&mut triangles, y0, y1, z1, z2, x2);
+
+    // 8. Front faces at y0 facing -Y (subdivided along x1, x2, z1)
+    add_quad_front(&mut triangles, x0, x1, z0, z1, y0);
+    add_quad_front(&mut triangles, x1, x2, z0, z1, y0);
+    add_quad_front(&mut triangles, x2, x3, z0, z1, y0);
+    add_quad_front(&mut triangles, x0, x1, z1, z2, y0);
+    add_quad_front(&mut triangles, x2, x3, z1, z2, y0);
+
+    // 9. Back faces at y1 facing +Y (subdivided along x1, x2, z1)
+    add_quad_back(&mut triangles, x0, x1, z0, z1, y1);
+    add_quad_back(&mut triangles, x1, x2, z0, z1, y1);
+    add_quad_back(&mut triangles, x2, x3, z0, z1, y1);
+    add_quad_back(&mut triangles, x0, x1, z1, z2, y1);
+    add_quad_back(&mut triangles, x2, x3, z1, z2, y1);
+
+    Mesh::new(triangles)
+}
+
