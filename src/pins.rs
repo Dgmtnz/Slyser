@@ -1,3 +1,4 @@
+use crate::bvh::BVH;
 use crate::cut::{unproject_from_plane_2d, CutResult};
 use crate::mesh::{Mesh, Triangle};
 use crate::primitives::create_box;
@@ -63,6 +64,8 @@ pub struct PinPlacement {
     pub angle: f32,
     /// Alignment pin size in mm.
     pub size: f32,
+    /// Safe cavity insertion depth in mm into each piece.
+    pub depth: f32,
 }
 
 /// Tests whether point `p` is strictly inside or on the boundary of CCW 2D triangle `(a, b, c)`.
@@ -215,11 +218,85 @@ fn polygon_centroid_2d(poly: &[Vec2]) -> Vec2 {
     Vec2::new(cx / (6.0 * signed_area), cy / (6.0 * signed_area))
 }
 
+/// Probes the distance from `origin` along `dir` to the outer surface of a mesh.
+/// Returns 0.0 if the ray misses or hits non-positively.
+fn probe_mesh_thickness(bvh: &BVH, origin: Vec3, dir: Vec3) -> f32 {
+    if let Some(hit) = bvh.intersect_ray_with_options(origin, dir, 1e-3, 1e4, None) {
+        return hit.t;
+    }
+    // Fallback: slight perturbation in case origin was exactly on a triangle edge or vertex
+    let offsets = [
+        Vec3::new(0.01, 0.0, 0.0),
+        Vec3::new(-0.01, 0.0, 0.0),
+        Vec3::new(0.0, 0.01, 0.0),
+        Vec3::new(0.0, -0.01, 0.0),
+    ];
+    for off in offsets {
+        if let Some(hit) = bvh.intersect_ray_with_options(origin + off, dir, 1e-3, 1e4, None) {
+            return hit.t;
+        }
+    }
+    0.0
+}
+
+/// Computes the safe socket cavity depth at candidate pin position `center_2d` with given `size` and `angle`.
+/// Probes solid wall thickness into both positive_mesh (+norm) and negative_mesh (-norm)
+/// at the socket center and the 4 corners.
+/// Leaves a mandatory solid safety wall of at least 1.8 mm.
+fn compute_safe_pin_depth(
+    center_2d: Vec2,
+    size: f32,
+    angle: f32,
+    cut_result: &CutResult,
+    config: &PinConfig,
+    bvh_pos: &BVH,
+    bvh_neg: &BVH,
+) -> f32 {
+    let socket_width = size + 2.0 * config.clearance;
+    let corners_2d = square_hole_corners(center_2d, socket_width, angle);
+    let plane_pt = cut_result.cut_plane.point;
+    let (u_axis, v_axis) = cut_result.plane_basis;
+    let norm = cut_result.cut_plane.normal.normalize();
+
+    let center_3d = unproject_from_plane_2d(center_2d, plane_pt, u_axis, v_axis);
+    let mut probe_points = Vec::with_capacity(5);
+    probe_points.push(center_3d);
+    for c in &corners_2d {
+        probe_points.push(unproject_from_plane_2d(*c, plane_pt, u_axis, v_axis));
+    }
+
+    let mut t_pos = f32::INFINITY;
+    for &pt in &probe_points {
+        let d = probe_mesh_thickness(bvh_pos, pt, norm);
+        if d <= 0.0 {
+            t_pos = 0.0;
+            break;
+        }
+        t_pos = t_pos.min(d);
+    }
+
+    let mut t_neg = f32::INFINITY;
+    for &pt in &probe_points {
+        let d = probe_mesh_thickness(bvh_neg, pt, -norm);
+        if d <= 0.0 {
+            t_neg = 0.0;
+            break;
+        }
+        t_neg = t_neg.min(d);
+    }
+
+    let safe_depth_pos = (t_pos - 1.8).max(0.0);
+    let safe_depth_neg = (t_neg - 1.8).max(0.0);
+    config.depth.min(safe_depth_pos).min(safe_depth_neg)
+}
+
 fn find_candidate_placements(
     cut_result: &CutResult,
     config: &PinConfig,
     candidate_size: f32,
     candidate_margin: f32,
+    bvh_pos: &BVH,
+    bvh_neg: &BVH,
 ) -> Vec<PinPlacement> {
     if cut_result.cut_polygons_2d.is_empty() {
         return Vec::new();
@@ -292,38 +369,62 @@ fn find_candidate_placements(
     let mut valid_placements = Vec::new();
     for c in candidate_centers {
         if is_square_inside_polygon(c, safe_width, poly) {
-            let p3d = unproject_from_plane_2d(
+            let safe_depth = compute_safe_pin_depth(
                 c,
+                candidate_size,
+                0.0,
+                cut_result,
+                config,
+                bvh_pos,
+                bvh_neg,
+            );
+            if safe_depth >= 1.5 {
+                let p3d = unproject_from_plane_2d(
+                    c,
+                    cut_result.cut_plane.point,
+                    cut_result.plane_basis.0,
+                    cut_result.plane_basis.1,
+                );
+                valid_placements.push(PinPlacement {
+                    center_2d: c,
+                    center_3d: p3d,
+                    angle: 0.0,
+                    size: candidate_size,
+                    depth: safe_depth,
+                });
+            }
+        }
+    }
+
+    if valid_placements.is_empty() && is_square_inside_polygon(centroid, safe_width, poly) {
+        let safe_depth = compute_safe_pin_depth(
+            centroid,
+            candidate_size,
+            0.0,
+            cut_result,
+            config,
+            bvh_pos,
+            bvh_neg,
+        );
+        if safe_depth >= 1.5 {
+            let p3d = unproject_from_plane_2d(
+                centroid,
                 cut_result.cut_plane.point,
                 cut_result.plane_basis.0,
                 cut_result.plane_basis.1,
             );
             valid_placements.push(PinPlacement {
-                center_2d: c,
+                center_2d: centroid,
                 center_3d: p3d,
                 angle: 0.0,
                 size: candidate_size,
+                depth: safe_depth,
             });
         }
     }
 
-    if valid_placements.is_empty() && is_square_inside_polygon(centroid, safe_width, poly) {
-        let p3d = unproject_from_plane_2d(
-            centroid,
-            cut_result.cut_plane.point,
-            cut_result.plane_basis.0,
-            cut_result.plane_basis.1,
-        );
-        valid_placements.push(PinPlacement {
-            center_2d: centroid,
-            center_3d: p3d,
-            angle: 0.0,
-            size: candidate_size,
-        });
-    }
-
     if valid_placements.is_empty() {
-        let grid_steps = 7;
+        let grid_steps = 11;
         for ix in 1..grid_steps {
             let tx = ix as f32 / grid_steps as f32;
             let gx = min_x + tx * span_x;
@@ -332,19 +433,31 @@ fn find_candidate_placements(
                 let gy = min_y + ty * span_y;
                 let pt = Vec2::new(gx, gy);
                 if is_square_inside_polygon(pt, safe_width, poly) {
-                    let p3d = unproject_from_plane_2d(
+                    let safe_depth = compute_safe_pin_depth(
                         pt,
-                        cut_result.cut_plane.point,
-                        cut_result.plane_basis.0,
-                        cut_result.plane_basis.1,
+                        candidate_size,
+                        0.0,
+                        cut_result,
+                        config,
+                        bvh_pos,
+                        bvh_neg,
                     );
-                    valid_placements.push(PinPlacement {
-                        center_2d: pt,
-                        center_3d: p3d,
-                        angle: 0.0,
-                        size: candidate_size,
-                    });
-                    return valid_placements;
+                    if safe_depth >= 1.5 {
+                        let p3d = unproject_from_plane_2d(
+                            pt,
+                            cut_result.cut_plane.point,
+                            cut_result.plane_basis.0,
+                            cut_result.plane_basis.1,
+                        );
+                        valid_placements.push(PinPlacement {
+                            center_2d: pt,
+                            center_3d: p3d,
+                            angle: 0.0,
+                            size: candidate_size,
+                            depth: safe_depth,
+                        });
+                        return valid_placements;
+                    }
                 }
             }
         }
@@ -356,8 +469,27 @@ fn find_candidate_placements(
 /// Finds safe locations inside the largest 2D cut polygon where a square socket fits completely.
 /// When adaptive pin sizing is enabled on config, adaptively finds smaller pin sizes and relaxed margins.
 pub fn find_pin_placements(cut_result: &CutResult, config: &PinConfig) -> Vec<PinPlacement> {
-    let default_placements =
-        find_candidate_placements(cut_result, config, config.size, config.edge_margin);
+    let pos_tris = if cut_result.positive_body.is_empty() {
+        &cut_result.positive_mesh.triangles
+    } else {
+        &cut_result.positive_body
+    };
+    let neg_tris = if cut_result.negative_body.is_empty() {
+        &cut_result.negative_mesh.triangles
+    } else {
+        &cut_result.negative_body
+    };
+    let bvh_pos = BVH::build(pos_tris);
+    let bvh_neg = BVH::build(neg_tris);
+
+    let default_placements = find_candidate_placements(
+        cut_result,
+        config,
+        config.size,
+        config.edge_margin,
+        &bvh_pos,
+        &bvh_neg,
+    );
     if !default_placements.is_empty() || !config.adaptive {
         return default_placements;
     }
@@ -368,7 +500,14 @@ pub fn find_pin_placements(cut_result: &CutResult, config: &PinConfig) -> Vec<Pi
     // Pass 1: Try smaller sizes with default edge_margin
     for &sz in &candidate_sizes {
         if sz < config.size && sz >= min_sz {
-            let placements = find_candidate_placements(cut_result, config, sz, config.edge_margin);
+            let placements = find_candidate_placements(
+                cut_result,
+                config,
+                sz,
+                config.edge_margin,
+                &bvh_pos,
+                &bvh_neg,
+            );
             if !placements.is_empty() {
                 return placements;
             }
@@ -378,15 +517,27 @@ pub fn find_pin_placements(cut_result: &CutResult, config: &PinConfig) -> Vec<Pi
     // Pass 2: Relax edge_margin down to 1.0 mm (first 1.5 mm, then 1.0 mm)
     for &relaxed_margin in &[1.5f32, 1.0] {
         if relaxed_margin < config.edge_margin {
-            let placements =
-                find_candidate_placements(cut_result, config, config.size, relaxed_margin);
+            let placements = find_candidate_placements(
+                cut_result,
+                config,
+                config.size,
+                relaxed_margin,
+                &bvh_pos,
+                &bvh_neg,
+            );
             if !placements.is_empty() {
                 return placements;
             }
             for &sz in &candidate_sizes {
                 if sz < config.size && sz >= min_sz {
-                    let placements =
-                        find_candidate_placements(cut_result, config, sz, relaxed_margin);
+                    let placements = find_candidate_placements(
+                        cut_result,
+                        config,
+                        sz,
+                        relaxed_margin,
+                        &bvh_pos,
+                        &bvh_neg,
+                    );
                     if !placements.is_empty() {
                         return placements;
                     }
@@ -660,7 +811,6 @@ pub fn apply_female_sockets_and_generate_pins(
         );
     }
 
-    let depth = config.depth;
     let norm = cut_result.cut_plane.normal.normalize();
     let plane_pt = cut_result.cut_plane.point;
     let (u_axis, v_axis) = cut_result.plane_basis;
@@ -722,8 +872,9 @@ pub fn apply_female_sockets_and_generate_pins(
         }
     }
 
-    // Add cavity walls and bottom faces for each socket
-    for hole in &holes {
+    // Add cavity walls and bottom faces for each socket using its adaptive safe depth
+    for (hole, p) in holes.iter().zip(placements.iter()) {
+        let depth = p.depth;
         let m0 = unproject_from_plane_2d(hole[0], plane_pt, u_axis, v_axis);
         let m1 = unproject_from_plane_2d(hole[1], plane_pt, u_axis, v_axis);
         let m2 = unproject_from_plane_2d(hole[2], plane_pt, u_axis, v_axis);
@@ -776,7 +927,7 @@ pub fn apply_female_sockets_and_generate_pins(
         .map(|p| {
             let pin_cfg = PinConfig {
                 size: p.size,
-                depth: config.depth,
+                depth: p.depth,
                 clearance: config.clearance,
                 edge_margin: config.edge_margin,
                 adaptive: false,

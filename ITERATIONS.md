@@ -104,14 +104,16 @@
   - Verificación de ejecución completa end-to-end sobre modelos STL.
 
 ### Iteración 7 (Completada)
-- **Fecha:** 2026-09-23
+- **Fecha:** 2026-09-24
 - **Acciones:**
   - Implementado algoritmo de clustering de componentes conexas en `Mesh` (`src/mesh.rs`) con cuantización de coordenadas a $10^{-4}$ mm y estructura Disjoint Set Union (DSU) (`connected_components`, `connected_components_count`, `is_contiguous`, `largest_connected_component`).
-  - Añadido generador `create_u_fork` en `src/primitives.rs` con subdivisión en cuadrícula para evitar uniones en T y garantizar manifold cerrado.
-  - Implementada restricción de contigüidad topológica en `src/optimizer.rs` (`enforce_contiguous: true`): descarte automático de planos de corte que fragmenten cualquier mitad en más de un componente significativo (> 0.5% del volumen).
-  - Implementado sistema de dimensionamiento adaptativo de clavijas en `src/pins.rs` (`PinConfig::adaptive`, `min_size`, `find_adaptive_pin_placements`, `apply_female_sockets_and_generate_pins_adaptive`): búsqueda sobre cuadrado inscrito con reducción automática de tamaño de pin (de 4.0 mm a 3.5, 3.0, 2.5, 2.0, 1.5 mm) y relajación perimetral de margen de borde (hasta 1.0 mm).
-  - Actualizado subcomando `partition` en CLI (`src/main.rs`) añadiendo flags `--allow-disjoint` y `--pin-min-size` con telemetría en terminal de contigüidad de piezas y tamaño de clavija utilizado.
-  - Creados 5 tests de integración en `tests/iteration_7.rs` cubriendo partición de cubos desconexos, componentes conexas de sólidos únicos, rechazo de planos fragmentadores en modelos en horquilla U, adaptación dimensional de clavijas en cuellos de 6x6 mm y cierre hermético (watertight) de todas las piezas y clavijas.
-  - Verificación exitosa: 54/54 tests aprobados en todas las suites (iteraciones 0 a 7), `cargo clippy --all-targets -- -D warnings` con 0 advertencias.
+  - **Preservación total de geometría:** Eliminada cualquier lógica de descarte de fragmentos o pérdida de volumen. Cero geometría eliminada (conservación del 100.0% del volumen del modelo original).
+  - **Planos inclinados para corte anatómico limpio:** Incorporada generación de planos candidatos inclinados (pitch/roll de ±15°, ±25°, ±35°) en cuellos de botella y centroides, permitiendo separar piezas orgánicas (ej. cuello en bustos) en un único lazo cerrado sin rozar ni separar puntas flotantes.
+  - **Sondeo de espesor y profundidad segura de clavijas:** Implementado sondeo por raycasting BVH (`probe_mesh_thickness`, `compute_safe_pin_depth`) desde el centro y los 4 vértices del cajeado hacia el interior de ambas piezas. Se descuenta un margen de seguridad de al menos 1.8 mm de pared sólida, garantizando que el cajeado nunca perfore ni rompa la superficie exterior.
+  - Dimensionamiento adaptativo de clavijas cuadradas con longitud ajustada a `2.0 * safe_depth - 0.4 mm`.
+  - Creados 6 tests de integración en `tests/iteration_7.rs`.
+  - Verificación exitosa: 55/55 tests aprobados en todas las suites (iteraciones 0 a 7), `cargo clippy --all-targets -- -D warnings` con 0 advertencias.
+  - Validación en `VenomEscalado.stl`: ambas piezas certificadas por PrusaSlicer como `manifold = yes` y `number_of_parts = 1`, con cajeado de 1.9 mm de profundidad y clavija [`pin_1.stl`](file:///home/dgmtnz/Documents/Slyser/pin_1.stl) de 2.5 x 2.5 x 3.4 mm.
+
 
 

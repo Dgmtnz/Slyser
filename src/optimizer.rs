@@ -1,4 +1,4 @@
-use crate::cut::slice_mesh_by_plane;
+use crate::cut::{compute_plane_basis, slice_mesh_by_plane};
 use crate::mesh::{Mesh, Plane, Triangle, AABB};
 use crate::orient::{find_optimal_orientation, OptimalOrientation};
 use crate::pins::{apply_female_sockets_and_generate_pins, PinConfig};
@@ -337,13 +337,54 @@ impl CandidatePlaneGenerator {
     /// 2. Geometric bottleneck planes (narrow necks and minimal cross-sections).
     /// 3. PCA / Principal axes planes of overhang clusters.
     /// 4. Planes offset along major axes between bounding box extents.
+    /// Generates candidate planes tilted by +-15, +-25, +-35 degrees
+    /// around base_normal (pitch, roll, and 45-degree diagonal combinations) through pivot.
+    pub fn generate_tilted_planes(pivot: Vec3, base_normal: Vec3) -> Vec<Plane> {
+        let (u, v) = compute_plane_basis(base_normal);
+        let angles = [15.0f32, 25.0, 35.0];
+        let azimuths = [0.0f32, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0];
+        let mut planes = Vec::with_capacity(angles.len() * azimuths.len());
+
+        for &ang_deg in &angles {
+            let theta = ang_deg.to_radians();
+            let sin_t = theta.sin();
+            let cos_t = theta.cos();
+            for &az_deg in &azimuths {
+                let psi = az_deg.to_radians();
+                let dir_plane = psi.cos() * u + psi.sin() * v;
+                let normal = (cos_t * base_normal + sin_t * dir_plane).normalize_or_zero();
+                if normal.length_squared() > 0.5 {
+                    planes.push(Plane::new(pivot, normal));
+                }
+            }
+        }
+
+        planes
+    }
+
+    /// Generates candidate cutting planes based on:
+    /// 1. Centroid planes and tilts around mesh center of mass and AABB center.
+    /// 2. Overhang boundary planes (Z-levels and coordinate planes at overhang junctions).
+    /// 3. Geometric bottleneck planes (narrow necks and minimal cross-sections).
+    /// 4. PCA / Principal axes planes of overhang clusters.
+    /// 5. Planes offset along major axes between bounding box extents.
     pub fn generate_candidates(mesh: &Mesh, config: &OptimizerConfig) -> Vec<Plane> {
         if mesh.is_empty() {
             return Vec::new();
         }
 
         let aabb = mesh.aabb();
+        let com = mesh.center_of_mass();
+        let aabb_center = aabb.center();
         let mut raw_planes: Vec<Plane> = Vec::new();
+
+        // 0. Centroid planes and tilts around mesh center of mass and AABB center
+        raw_planes.push(Plane::new(com, Vec3::Z));
+        raw_planes.extend(Self::generate_tilted_planes(com, Vec3::Z));
+        if (com - aabb_center).length() > 0.5 {
+            raw_planes.push(Plane::new(aabb_center, Vec3::Z));
+            raw_planes.extend(Self::generate_tilted_planes(aabb_center, Vec3::Z));
+        }
 
         // 1. Overhang boundary planes
         let overhang_planes = Self::overhang_boundary_planes(mesh, config, &aabb);
@@ -372,6 +413,7 @@ impl CandidatePlaneGenerator {
         aabb: &AABB,
     ) -> Vec<Plane> {
         let center = aabb.center();
+        let com = mesh.center_of_mass();
         let z_bed = aabb.min.z;
         let mut planes = Vec::new();
 
@@ -406,9 +448,16 @@ impl CandidatePlaneGenerator {
         }
 
         z_levels.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (z, _) in z_levels.iter().take(6) {
+        for (z, _) in z_levels.iter().take(4) {
             if *z > aabb.min.z + 0.5 && *z < aabb.max.z - 0.5 {
-                planes.push(Plane::new(Vec3::new(center.x, center.y, *z), Vec3::Z));
+                let p = Vec3::new(center.x, center.y, *z);
+                planes.push(Plane::new(p, Vec3::Z));
+                planes.extend(Self::generate_tilted_planes(p, Vec3::Z));
+                let p_com = Vec3::new(com.x, com.y, *z);
+                if (p - p_com).length() > 0.5 {
+                    planes.push(Plane::new(p_com, Vec3::Z));
+                    planes.extend(Self::generate_tilted_planes(p_com, Vec3::Z));
+                }
             }
         }
 
@@ -465,6 +514,7 @@ impl CandidatePlaneGenerator {
     /// Heuristic 2: Geometric bottleneck planes swept along X, Y, Z axes.
     pub fn bottleneck_planes(mesh: &Mesh, aabb: &AABB) -> Vec<Plane> {
         let center = aabb.center();
+        let com = mesh.center_of_mass();
         let mut planes = Vec::new();
         let samples = 25;
 
@@ -490,10 +540,15 @@ impl CandidatePlaneGenerator {
                     || (next - curr).abs() > 0.25 * curr.max(next);
 
                 if is_local_min || is_step {
-                    planes.push(Plane::new(
-                        Vec3::new(center.x, center.y, areas_z[i].0),
-                        Vec3::Z,
-                    ));
+                    let z_val = areas_z[i].0;
+                    let p_center = Vec3::new(center.x, center.y, z_val);
+                    planes.push(Plane::new(p_center, Vec3::Z));
+                    planes.extend(Self::generate_tilted_planes(p_center, Vec3::Z));
+                    let p_com = Vec3::new(com.x, com.y, z_val);
+                    if (p_center - p_com).length() > 0.5 {
+                        planes.push(Plane::new(p_com, Vec3::Z));
+                        planes.extend(Self::generate_tilted_planes(p_com, Vec3::Z));
+                    }
                 }
             }
         }
@@ -518,10 +573,9 @@ impl CandidatePlaneGenerator {
                     || (curr - prev).abs() > 0.25 * curr.max(prev)
                     || (next - curr).abs() > 0.25 * curr.max(next)
                 {
-                    planes.push(Plane::new(
-                        Vec3::new(areas_x[i].0, center.y, center.z),
-                        Vec3::X,
-                    ));
+                    let p_center = Vec3::new(areas_x[i].0, center.y, center.z);
+                    planes.push(Plane::new(p_center, Vec3::X));
+                    planes.extend(Self::generate_tilted_planes(p_center, Vec3::X));
                 }
             }
         }
@@ -546,10 +600,9 @@ impl CandidatePlaneGenerator {
                     || (curr - prev).abs() > 0.25 * curr.max(prev)
                     || (next - curr).abs() > 0.25 * curr.max(next)
                 {
-                    planes.push(Plane::new(
-                        Vec3::new(center.x, areas_y[i].0, center.z),
-                        Vec3::Y,
-                    ));
+                    let p_center = Vec3::new(center.x, areas_y[i].0, center.z);
+                    planes.push(Plane::new(p_center, Vec3::Y));
+                    planes.extend(Self::generate_tilted_planes(p_center, Vec3::Y));
                 }
             }
         }
@@ -614,6 +667,10 @@ impl CandidatePlaneGenerator {
 
         let (eigenvectors, _) = jacobi_eigen_3x3(cov);
 
+        // Tilted planes around overhang centroid
+        planes.push(Plane::new(centroid, Vec3::Z));
+        planes.extend(Self::generate_tilted_planes(centroid, Vec3::Z));
+
         for col in 0..3 {
             let axis = Vec3::new(
                 eigenvectors[0][col],
@@ -624,6 +681,7 @@ impl CandidatePlaneGenerator {
 
             if axis.length_squared() > 0.5 {
                 planes.push(Plane::new(centroid, axis));
+                planes.extend(Self::generate_tilted_planes(centroid, axis));
 
                 // Also generate plane at median projection
                 let mut projs: Vec<f32> = overhang_tris
@@ -636,7 +694,9 @@ impl CandidatePlaneGenerator {
                 projs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 if !projs.is_empty() {
                     let median = projs[projs.len() / 2];
-                    planes.push(Plane::new(axis * median, axis));
+                    let p_med = axis * median;
+                    planes.push(Plane::new(p_med, axis));
+                    planes.extend(Self::generate_tilted_planes(p_med, axis));
                 }
             }
         }
@@ -752,19 +812,18 @@ fn evaluate_candidate_plane(
         return None;
     }
 
+    let mut contiguity_penalty = 0.0f32;
     if config.enforce_contiguous {
-        let is_multi_body = |m: &Mesh| -> bool {
+        let is_fragmented = |m: &Mesh| -> bool {
             let comps = m.connected_components();
             if comps.len() <= 1 {
                 return false;
             }
-            let threshold = 0.03 * m.total_volume();
-            let significant_count = comps.iter().filter(|c| c.total_volume() > threshold).count();
-            significant_count > 1
+            comps.iter().filter(|c| c.total_volume() > 1e-4).count() > 1
         };
 
-        if is_multi_body(&cut_result.positive_mesh) || is_multi_body(&cut_result.negative_mesh) {
-            return None;
+        if is_fragmented(&cut_result.positive_mesh) || is_fragmented(&cut_result.negative_mesh) {
+            contiguity_penalty = 1e6;
         }
     }
 
@@ -773,7 +832,9 @@ fn evaluate_candidate_plane(
 
     let support_vol =
         pos_opt.metrics.estimated_support_volume + neg_opt.metrics.estimated_support_volume;
-    let score = config.weight_support * support_vol + config.weight_cut_area * cut_result.cut_area;
+    let score = config.weight_support * support_vol
+        + config.weight_cut_area * cut_result.cut_area
+        + contiguity_penalty;
 
     Some(CandidateEvaluation {
         plane: *plane,
@@ -782,8 +843,8 @@ fn evaluate_candidate_plane(
 }
 
 /// Enforces single contiguous solid guarantee by processing connected components.
-/// Keeps the dominant primary component, discards tiny floating debris (< 3% volume),
-/// and collects significant secondary components (>= 5% volume) if pieces budget allows.
+/// Promotes secondary components if pieces budget allows, and preserves all geometry
+/// by keeping every triangle without deleting anything.
 fn extract_contiguous_components(mesh: Mesh, max_additional: usize) -> (Mesh, Vec<Mesh>) {
     let comps = mesh.connected_components();
     if comps.is_empty() {
@@ -793,21 +854,17 @@ fn extract_contiguous_components(mesh: Mesh, max_additional: usize) -> (Mesh, Ve
         return (comps.into_iter().next().unwrap(), Vec::new());
     }
 
-    let total_vol: f32 = comps.iter().map(|c| c.total_volume()).sum();
-    let primary = comps[0].clone();
+    let mut primary = comps[0].clone();
     let mut promoted = Vec::new();
-
     let mut remaining_budget = max_additional;
-    for c in comps.into_iter().skip(1) {
-        let vol_ratio = if total_vol > 1e-6 {
-            c.total_volume() / total_vol
-        } else {
-            0.0
-        };
 
-        if vol_ratio >= 0.05 && remaining_budget > 0 {
+    for c in comps.into_iter().skip(1) {
+        if remaining_budget > 0 {
             promoted.push(c);
             remaining_budget -= 1;
+        } else {
+            // NEVER discard geometry: keep all triangles in primary mesh!
+            primary.triangles.extend(c.triangles);
         }
     }
 
@@ -835,9 +892,25 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
 
     // If already requires 0 support or max_pieces <= 1, do not cut
     if orig_metrics.estimated_support_volume <= 1e-4 || config.max_pieces <= 1 {
-        let (clean_mesh, _) = extract_contiguous_components(mesh.clone(), 0);
-        let optimal = find_optimal_orientation(&clean_mesh, &config.support_config);
-        let final_support = optimal.metrics.estimated_support_volume;
+        let (primary, promoted) =
+            extract_contiguous_components(mesh.clone(), config.max_pieces.saturating_sub(1));
+        let mut pieces_to_orient = vec![primary];
+        pieces_to_orient.extend(promoted);
+
+        let mut pieces = Vec::with_capacity(pieces_to_orient.len());
+        let mut final_support = 0.0f32;
+
+        for (i, m) in pieces_to_orient.into_iter().enumerate() {
+            let optimal = find_optimal_orientation(&m, &config.support_config);
+            final_support += optimal.metrics.estimated_support_volume;
+            pieces.push(PartitionPiece {
+                id: i + 1,
+                mesh: optimal.mesh,
+                metrics: optimal.metrics,
+                contact_area: optimal.contact_area,
+            });
+        }
+
         let orig_sup = orig_metrics.estimated_support_volume;
         let reduction = if orig_sup > 1e-6 {
             ((orig_sup - final_support) / orig_sup * 100.0).clamp(0.0, 100.0)
@@ -847,12 +920,7 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
 
         return OptimizationResult {
             original_metrics: orig_metrics,
-            pieces: vec![PartitionPiece {
-                id: 1,
-                mesh: optimal.mesh,
-                metrics: optimal.metrics,
-                contact_area: optimal.contact_area,
-            }],
+            pieces,
             pins: Vec::new(),
             cuts_made: 0,
             total_support_volume: final_support,
@@ -975,9 +1043,25 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
     }
 
     if cuts_made == 0 {
-        let (clean_mesh, _) = extract_contiguous_components(mesh.clone(), 0);
-        let optimal = find_optimal_orientation(&clean_mesh, &config.support_config);
-        let final_support = optimal.metrics.estimated_support_volume;
+        let (primary, promoted) =
+            extract_contiguous_components(mesh.clone(), config.max_pieces.saturating_sub(1));
+        let mut pieces_to_orient = vec![primary];
+        pieces_to_orient.extend(promoted);
+
+        let mut pieces = Vec::with_capacity(pieces_to_orient.len());
+        let mut final_support = 0.0f32;
+
+        for (i, m) in pieces_to_orient.into_iter().enumerate() {
+            let optimal = find_optimal_orientation(&m, &config.support_config);
+            final_support += optimal.metrics.estimated_support_volume;
+            pieces.push(PartitionPiece {
+                id: i + 1,
+                mesh: optimal.mesh,
+                metrics: optimal.metrics,
+                contact_area: optimal.contact_area,
+            });
+        }
+
         let orig_sup = orig_metrics.estimated_support_volume;
         let reduction = if orig_sup > 1e-6 {
             ((orig_sup - final_support) / orig_sup * 100.0).clamp(0.0, 100.0)
@@ -987,12 +1071,7 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
 
         OptimizationResult {
             original_metrics: orig_metrics,
-            pieces: vec![PartitionPiece {
-                id: 1,
-                mesh: optimal.mesh,
-                metrics: optimal.metrics,
-                contact_area: optimal.contact_area,
-            }],
+            pieces,
             pins: Vec::new(),
             cuts_made: 0,
             total_support_volume: final_support,
