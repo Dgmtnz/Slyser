@@ -454,9 +454,72 @@ impl Mesh {
             }
         }
 
+        let mut has_unmatched = false;
         for (&(a, b), &count) in &edge_counts {
             let twin_count = edge_counts.get(&(b, a)).copied().unwrap_or(0);
             if count != twin_count {
+                has_unmatched = true;
+                break;
+            }
+        }
+
+        if !has_unmatched {
+            return true;
+        }
+
+        // Robust fallback: weld vertices within 1-micron (0.001 mm) tolerance
+        // to handle floating-point rounding across rigid grid quantization boundaries.
+        let mut canonical_verts: Vec<Vec3> = Vec::new();
+        let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<usize>> =
+            std::collections::HashMap::new();
+
+        let mut get_or_insert_vertex = |v: Vec3| -> usize {
+            let gx = (v.x * 1e3).floor() as i64;
+            let gy = (v.y * 1e3).floor() as i64;
+            let gz = (v.z * 1e3).floor() as i64;
+
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(indices) = grid.get(&(gx + dx, gy + dy, gz + dz)) {
+                            for &idx in indices {
+                                if (canonical_verts[idx] - v).length() <= 1e-3 {
+                                    return idx;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let idx = canonical_verts.len();
+            canonical_verts.push(v);
+            grid.entry((gx, gy, gz)).or_default().push(idx);
+            idx
+        };
+
+        let mut unified_edge_counts: std::collections::HashMap<(usize, usize), i32> =
+            std::collections::HashMap::with_capacity(self.triangles.len() * 3);
+
+        for tri in &self.triangles {
+            let i0 = get_or_insert_vertex(tri.vertices[0]);
+            let i1 = get_or_insert_vertex(tri.vertices[1]);
+            let i2 = get_or_insert_vertex(tri.vertices[2]);
+
+            if i0 != i1 {
+                *unified_edge_counts.entry((i0, i1)).or_insert(0) += 1;
+            }
+            if i1 != i2 {
+                *unified_edge_counts.entry((i1, i2)).or_insert(0) += 1;
+            }
+            if i2 != i0 {
+                *unified_edge_counts.entry((i2, i0)).or_insert(0) += 1;
+            }
+        }
+
+        for (&(a, b), &count) in &unified_edge_counts {
+            let twin = unified_edge_counts.get(&(b, a)).copied().unwrap_or(0);
+            if count != twin {
                 return false;
             }
         }

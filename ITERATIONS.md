@@ -11,6 +11,7 @@
 | **5** | Optimizador inteligente de particiones (Pareto) | Completada | Heurísticas multiescala (overhangs, cuellos de botella, PCA, offsets), exploración paralela con Rayon en 16 hilos, reducción 100% de soporte en T-bracket. 6 tests pasando. |
 | **6** | CLI completa, estadísticas y validación end-to-end | Completada | Subcomando `partition` con flags completas, reporte de métricas en terminal y exportación STL de piezas a Z=0 y clavijas. |
 | **7** | Garantía de piezas contiguas (sin fragmentos desconexos) y clavijas adaptativas | Completada | DSU de componentes conexas, restricción en cortes del optimizador y auto-escalado adaptativo de clavijas en secciones estrechas. 5 tests pasando. |
+| **8** | Máxima calidad: búsqueda exhaustiva densa y refinamiento local (Hill-Climbing) | Completada | 100 muestras en cuellos, pasos angulares de 5°, refinamiento estocástico local alrededor del óptimo y 48 clústeres en orientación. 7 tests pasando. |
 
 ---
 
@@ -114,6 +115,22 @@
   - Creados 6 tests de integración en `tests/iteration_7.rs`.
   - Verificación exitosa: 55/55 tests aprobados en todas las suites (iteraciones 0 a 7), `cargo clippy --all-targets -- -D warnings` con 0 advertencias.
   - Validación en `VenomEscalado.stl`: ambas piezas certificadas por PrusaSlicer como `manifold = yes` y `number_of_parts = 1`, con cajeado de 1.9 mm de profundidad y clavija [`pin_1.stl`](file:///home/dgmtnz/Documents/Slyser/pin_1.stl) de 2.5 x 2.5 x 3.4 mm.
+
+### Iteración 8 (Completada)
+- **Fecha:** 2026-09-24
+- **Objetivos:**
+  - Configurar por defecto el modo de máxima calidad exhaustiva.
+  - Cuadruplicar el muestreo de cuellos de botella (de 25 a 100 muestras en X, Y, Z).
+  - Exploración angular densa en pasos de 5° (pitch/roll de ±5°, ±10°, ±15°, ±20°, ±25°, ±30°, ±35°, ±40°, ±45°) y combinaciones diagonales compuestas.
+  - Deduplicación fina preservando diferencias angulares de hasta 1.5° (dot > 0.9996) y distancia de 0.2 mm.
+  - Implementación de refinamiento local iterativo (Hill-Climbing / Polish) con micro-ajustes angulares (±0.5°, ±1.0°, ±2.0°) y posicionales (±0.1, ±0.25, ±0.5 mm) sobre el plano óptimo.
+  - Duplicación de orientaciones candidatas de apoyo en cama a 48 clústeres planares y micro-inclinaciones ortogonales (±2.5°, ±5.0°).
+  - Optimización de memoria en búsqueda de orientación para eliminar clones intermedios redundantes.
+  - Fast-path en `analyze_support` para mallas sin voladizos (evitando construcción innecesaria de BVH).
+  - Robustez de tolerancia de soldadura de 1 micra en `Mesh::is_closed` ante ruido en coma flotante.
+  - Verificación exitosa: 61/61 tests aprobados en todas las suites (iteraciones 0 a 8), `cargo clippy --all-targets -- -D warnings` con 0 advertencias.
+  - Validación en `VenomEscalado.stl`: reducción del volumen de soporte a 1795.25 mm³ (62.5% de reducción frente al 49.8% basal), 1 clavija de 4.0 mm generada, ambas piezas son sólidos cerrados de 1 único componente contiguo y conservación volumétrica completa.
+
 
 
 

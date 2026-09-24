@@ -110,9 +110,9 @@ pub fn extract_candidate_orientations(mesh: &Mesh) -> Vec<OrientationCandidate> 
     let min_significant_area = total_area * 0.01; // 1% of total area
     let mut candidates: Vec<OrientationCandidate> = Vec::new();
 
-    // Select clusters meeting significant area threshold, or at least the top 24 largest
+    // Select clusters meeting significant area threshold, or at least the top 48 largest
     for (i, cl) in clusters.iter().enumerate() {
-        if cl.area >= min_significant_area || i < 24 {
+        if cl.area >= min_significant_area || i < 48 {
             let rot = rotation_to_down(cl.normal);
             candidates.push(OrientationCandidate {
                 rotation: rot,
@@ -300,8 +300,18 @@ pub fn is_orientation_stable(mesh_on_bed: &Mesh) -> bool {
     point_in_convex_polygon_2d(com_xy, &hull)
 }
 
+/// Evaluated candidate orientation metrics without retaining cloned meshes in memory.
+#[derive(Debug, Clone, PartialEq)]
+struct EvaluatedOrientation {
+    rotation: Quat,
+    translation: Vec3,
+    metrics: SupportMetrics,
+    contact_area: f32,
+    is_stable: bool,
+}
+
 /// Evaluates whether candidate `a` is preferable to candidate `b` according to multi-objective fitness.
-fn is_better(a: &OptimalOrientation, b: &OptimalOrientation) -> bool {
+fn is_better_eval(a: &EvaluatedOrientation, b: &EvaluatedOrientation) -> bool {
     // Primary: minimize estimated_support_volume
     let vol_diff = a.metrics.estimated_support_volume - b.metrics.estimated_support_volume;
     if vol_diff.abs() > 1e-2 {
@@ -328,6 +338,26 @@ fn is_better(a: &OptimalOrientation, b: &OptimalOrientation) -> bool {
     false
 }
 
+/// Evaluates whether candidate `a` is preferable to candidate `b` according to multi-objective fitness.
+#[allow(dead_code)]
+fn is_better(a: &OptimalOrientation, b: &OptimalOrientation) -> bool {
+    let ea = EvaluatedOrientation {
+        rotation: a.rotation,
+        translation: a.translation,
+        metrics: a.metrics.clone(),
+        contact_area: a.contact_area,
+        is_stable: a.is_stable,
+    };
+    let eb = EvaluatedOrientation {
+        rotation: b.rotation,
+        translation: b.translation,
+        metrics: b.metrics.clone(),
+        contact_area: b.contact_area,
+        is_stable: b.is_stable,
+    };
+    is_better_eval(&ea, &eb)
+}
+
 /// Evaluates candidate orientations in parallel across all CPU threads and returns the optimal orientation.
 pub fn find_optimal_orientation(
     mesh: &Mesh,
@@ -346,54 +376,87 @@ pub fn find_optimal_orientation(
 
     let candidates = extract_candidate_orientations(mesh);
 
-    let evaluated: Vec<OptimalOrientation> = candidates
+    let eval_one = |rot: Quat| -> EvaluatedOrientation {
+        let mut rotated = mesh.rotated(rot);
+        let aabb = rotated.aabb();
+        let translation = Vec3::new(0.0, 0.0, -aabb.min.z);
+        rotated.translate(translation);
+
+        let metrics = analyze_support(&rotated, support_config);
+        let contact_area = compute_bed_contact_area(&rotated);
+        let is_stable = is_orientation_stable(&rotated);
+
+        EvaluatedOrientation {
+            rotation: rot,
+            translation,
+            metrics,
+            contact_area,
+            is_stable,
+        }
+    };
+
+    let mut evaluated: Vec<EvaluatedOrientation> = candidates
         .into_par_iter()
-        .map(|cand| {
-            let mut rotated = mesh.rotated(cand.rotation);
-            let aabb = rotated.aabb();
-            let translation = Vec3::new(0.0, 0.0, -aabb.min.z);
-            rotated.translate(translation);
-
-            let metrics = analyze_support(&rotated, support_config);
-            let contact_area = compute_bed_contact_area(&rotated);
-            let is_stable = is_orientation_stable(&rotated);
-
-            OptimalOrientation {
-                rotation: cand.rotation,
-                translation,
-                mesh: rotated,
-                metrics,
-                contact_area,
-                is_stable,
-            }
-        })
+        .map(|cand| eval_one(cand.rotation))
         .collect();
 
-    evaluated
+    // Sort to determine the top candidate orientations (best first)
+    evaluated.sort_by(|a, b| {
+        if is_better_eval(a, b) {
+            std::cmp::Ordering::Less
+        } else if is_better_eval(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+
+    // For the top 3 candidate orientations, add fine tilt evaluations
+    // (±2.5° and ±5.0° around orthogonal axes) to discover exact zero-support resting orientations.
+    let top_candidates: Vec<Quat> = evaluated
+        .iter()
+        .take(3)
+        .map(|e| e.rotation)
+        .collect();
+
+    let tilt_angles = [-5.0f32, -2.5, 2.5, 5.0];
+    let mut fine_tilt_rotations: Vec<Quat> = Vec::new();
+
+    for &base_rot in &top_candidates {
+        for &deg in &tilt_angles {
+            let rad = deg.to_radians();
+            fine_tilt_rotations.push(Quat::from_rotation_x(rad) * base_rot);
+            fine_tilt_rotations.push(Quat::from_rotation_y(rad) * base_rot);
+        }
+    }
+
+    let fine_evaluated: Vec<EvaluatedOrientation> = fine_tilt_rotations
+        .into_par_iter()
+        .map(eval_one)
+        .collect();
+
+    evaluated.extend(fine_evaluated);
+
+    let best = evaluated
         .into_iter()
         .reduce(|best, current| {
-            if is_better(&current, &best) {
+            if is_better_eval(&current, &best) {
                 current
             } else {
                 best
             }
         })
-        .unwrap_or_else(|| {
-            let mut oriented = mesh.clone();
-            let aabb = oriented.aabb();
-            let translation = Vec3::new(0.0, 0.0, -aabb.min.z);
-            oriented.translate(translation);
-            let metrics = analyze_support(&oriented, support_config);
-            let contact_area = compute_bed_contact_area(&oriented);
-            let is_stable = is_orientation_stable(&oriented);
+        .unwrap_or_else(|| eval_one(Quat::IDENTITY));
 
-            OptimalOrientation {
-                rotation: Quat::IDENTITY,
-                translation,
-                mesh: oriented,
-                metrics,
-                contact_area,
-                is_stable,
-            }
-        })
+    let mut oriented = mesh.rotated(best.rotation);
+    oriented.translate(best.translation);
+
+    OptimalOrientation {
+        rotation: best.rotation,
+        translation: best.translation,
+        mesh: oriented,
+        metrics: best.metrics,
+        contact_area: best.contact_area,
+        is_stable: best.is_stable,
+    }
 }

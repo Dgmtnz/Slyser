@@ -798,11 +798,11 @@ fn triangulate_polygon_with_holes_indexed(
 
 /// Applies female socket cavities into both `positive_mesh` and `negative_mesh` on the cut plane,
 /// and generates independent square alignment pin meshes.
-pub fn apply_female_sockets_and_generate_pins(
+fn apply_sockets_for_placements(
     cut_result: &CutResult,
     config: &PinConfig,
+    placements: &[PinPlacement],
 ) -> (Mesh, Mesh, Vec<Mesh>) {
-    let placements = find_pin_placements(cut_result, config);
     if placements.is_empty() {
         return (
             cut_result.positive_mesh.clone(),
@@ -938,6 +938,46 @@ pub fn apply_female_sockets_and_generate_pins(
         .collect();
 
     (positive_mesh, negative_mesh, pin_meshes)
+}
+
+/// Applies female socket cavities into both `positive_mesh` and `negative_mesh` on the cut plane,
+/// verifying that sockets do not pierce the outer shell and remain 100% closed solids.
+pub fn apply_female_sockets_and_generate_pins(
+    cut_result: &CutResult,
+    config: &PinConfig,
+) -> (Mesh, Mesh, Vec<Mesh>) {
+    let mut try_configs = Vec::new();
+    try_configs.push(*config);
+
+    if config.adaptive {
+        let candidate_sizes = [3.5f32, 3.0, 2.5, 2.0, 1.5];
+        let min_sz = config.min_size.max(1.0);
+        for &sz in &candidate_sizes {
+            if sz < config.size && sz >= min_sz {
+                let mut c = *config;
+                c.size = sz;
+                try_configs.push(c);
+            }
+        }
+    }
+
+    for cfg in try_configs {
+        let placements = find_pin_placements(cut_result, &cfg);
+        if placements.is_empty() {
+            continue;
+        }
+
+        let (pos_m, neg_m, pins) = apply_sockets_for_placements(cut_result, &cfg, &placements);
+        if pos_m.is_closed() && neg_m.is_closed() {
+            return (pos_m, neg_m, pins);
+        }
+    }
+
+    (
+        cut_result.positive_mesh.clone(),
+        cut_result.negative_mesh.clone(),
+        Vec::new(),
+    )
 }
 
 /// Applies female socket cavities and generates square pins with adaptive sizing enabled,

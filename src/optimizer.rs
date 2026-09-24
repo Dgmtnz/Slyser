@@ -332,18 +332,14 @@ fn compute_cross_section_area_y(mesh: &Mesh, y: f32) -> f32 {
 pub struct CandidatePlaneGenerator;
 
 impl CandidatePlaneGenerator {
-    /// Generates candidate cutting planes based on:
-    /// 1. Overhang boundary planes (Z-levels and coordinate planes at overhang junctions).
-    /// 2. Geometric bottleneck planes (narrow necks and minimal cross-sections).
-    /// 3. PCA / Principal axes planes of overhang clusters.
-    /// 4. Planes offset along major axes between bounding box extents.
-    /// Generates candidate planes tilted by +-15, +-25, +-35 degrees
-    /// around base_normal (pitch, roll, and 45-degree diagonal combinations) through pivot.
+    /// Generates candidate planes tilted in dense 5-degree increments:
+    /// Pitch and roll at [±5.0°, ±10.0°, ±15.0°, ±20.0°, ±25.0°, ±30.0°, ±35.0°, ±40.0°, ±45.0°]
+    /// around base_normal, plus compound diagonal tilts through pivot.
     pub fn generate_tilted_planes(pivot: Vec3, base_normal: Vec3) -> Vec<Plane> {
         let (u, v) = compute_plane_basis(base_normal);
-        let angles = [15.0f32, 25.0, 35.0];
+        let angles = [5.0f32, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0];
         let azimuths = [0.0f32, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0];
-        let mut planes = Vec::with_capacity(angles.len() * azimuths.len());
+        let mut planes = Vec::with_capacity(angles.len() * azimuths.len() + 12);
 
         for &ang_deg in &angles {
             let theta = ang_deg.to_radians();
@@ -355,6 +351,21 @@ impl CandidatePlaneGenerator {
                 let normal = (cos_t * base_normal + sin_t * dir_plane).normalize_or_zero();
                 if normal.length_squared() > 0.5 {
                     planes.push(Plane::new(pivot, normal));
+                }
+            }
+        }
+
+        // Compound diagonal tilts (e.g. pitch=±15° & roll=±15°, pitch=±25° & roll=±25°)
+        for &comp_deg in &[15.0f32, 25.0, 35.0] {
+            let rad = comp_deg.to_radians();
+            for &s_p in &[1.0f32, -1.0] {
+                for &s_r in &[1.0f32, -1.0] {
+                    let rot_u = glam::Quat::from_axis_angle(u, s_p * rad);
+                    let rot_v = glam::Quat::from_axis_angle(v, s_r * rad);
+                    let normal = (rot_u * rot_v * base_normal).normalize_or_zero();
+                    if normal.length_squared() > 0.5 {
+                        planes.push(Plane::new(pivot, normal));
+                    }
                 }
             }
         }
@@ -516,7 +527,7 @@ impl CandidatePlaneGenerator {
         let center = aabb.center();
         let com = mesh.center_of_mass();
         let mut planes = Vec::new();
-        let samples = 25;
+        let samples = 100;
 
         // Sweep along Z
         let span_z = aabb.max.z - aabb.min.z;
@@ -739,7 +750,7 @@ impl CandidatePlaneGenerator {
     }
 
     /// Filters planes to ensure intersection with AABB and removes duplicates.
-    fn deduplicate_planes(raw_planes: Vec<Plane>, aabb: &AABB) -> Vec<Plane> {
+    pub fn deduplicate_planes(raw_planes: Vec<Plane>, aabb: &AABB) -> Vec<Plane> {
         let center = aabb.center();
         let half_diag = aabb.size().length() * 0.5;
         let mut unique: Vec<Plane> = Vec::new();
@@ -768,9 +779,9 @@ impl CandidatePlaneGenerator {
 
             let is_dup = unique.iter().any(|existing| {
                 let dot = existing.normal.dot(canon_n);
-                if dot > 0.99 {
+                if dot > 0.9996 {
                     let d_exist = existing.point.dot(existing.normal);
-                    (d_exist - canon_d).abs() < 0.4
+                    (d_exist - canon_d).abs() < 0.2
                 } else {
                     false
                 }
@@ -783,16 +794,28 @@ impl CandidatePlaneGenerator {
 
         unique
     }
+
+    /// Refines a candidate plane using local hill-climbing micro-perturbations.
+    pub fn refine_candidate_plane(
+        mesh: &Mesh,
+        initial_plane: &Plane,
+        initial_score: f32,
+        config: &OptimizerConfig,
+        orig_vol: f32,
+    ) -> Plane {
+        refine_candidate_plane(mesh, initial_plane, initial_score, config, orig_vol)
+    }
 }
 
 /// Intermediate result of candidate plane evaluation.
-struct CandidateEvaluation {
-    plane: Plane,
-    score: f32,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CandidateEvaluation {
+    pub plane: Plane,
+    pub score: f32,
 }
 
 /// Evaluates a single candidate plane on a mesh.
-fn evaluate_candidate_plane(
+pub fn evaluate_candidate_plane(
     mesh: &Mesh,
     plane: &Plane,
     config: &OptimizerConfig,
@@ -812,6 +835,11 @@ fn evaluate_candidate_plane(
         return None;
     }
 
+    // Both sliced halves must be closed, watertight 2-manifolds
+    if !cut_result.positive_mesh.is_closed() || !cut_result.negative_mesh.is_closed() {
+        return None;
+    }
+
     let mut contiguity_penalty = 0.0f32;
     if config.enforce_contiguous {
         let is_fragmented = |m: &Mesh| -> bool {
@@ -827,6 +855,13 @@ fn evaluate_candidate_plane(
         }
     }
 
+    if contiguity_penalty > 0.0 {
+        return Some(CandidateEvaluation {
+            plane: *plane,
+            score: contiguity_penalty,
+        });
+    }
+
     let pos_opt = find_optimal_orientation(&cut_result.positive_mesh, &config.support_config);
     let neg_opt = find_optimal_orientation(&cut_result.negative_mesh, &config.support_config);
 
@@ -840,6 +875,72 @@ fn evaluate_candidate_plane(
         plane: *plane,
         score,
     })
+}
+
+/// Local Hill-Climbing Refinement: executes micro-perturbations around the best candidate plane.
+/// Generates angular tilts ([±0.5°, ±1.0°, ±2.0°] along 4 radial tangent directions)
+/// and normal offsets ([±0.1 mm, ±0.25 mm, ±0.5 mm] along the normal vector).
+/// If a perturbation strictly improves the Pareto score while maintaining single contiguous components,
+/// updates the best plane and repeats for a second refinement pass.
+pub fn refine_candidate_plane(
+    mesh: &Mesh,
+    initial_plane: &Plane,
+    initial_score: f32,
+    config: &OptimizerConfig,
+    orig_vol: f32,
+) -> Plane {
+    let mut current_plane = *initial_plane;
+    let mut current_score = initial_score;
+
+    for _pass in 0..2 {
+        let n = current_plane.normal.normalize_or_zero();
+        if n.length_squared() < 0.5 {
+            break;
+        }
+        let (u, v) = compute_plane_basis(n);
+        let radial_dirs = [u, -u, v, -v];
+        let tilt_angles = [0.5f32, 1.0, 2.0];
+        let offsets = [-0.5f32, -0.25, -0.1, 0.1, 0.25, 0.5];
+
+        let mut candidates =
+            Vec::with_capacity(radial_dirs.len() * tilt_angles.len() + offsets.len());
+
+        // Angular tilts: [±0.5°, ±1.0°, ±2.0°] along 4 radial tangent directions
+        for &d in &radial_dirs {
+            for &ang in &tilt_angles {
+                let rad = ang.to_radians();
+                let tilted_n = (rad.cos() * n + rad.sin() * d).normalize_or_zero();
+                if tilted_n.length_squared() > 0.5 {
+                    candidates.push(Plane::new(current_plane.point, tilted_n));
+                }
+            }
+        }
+
+        // Normal offsets: [±0.1 mm, ±0.25 mm, ±0.5 mm] along the normal vector
+        for &offset in &offsets {
+            candidates.push(Plane::new(current_plane.point + offset * n, n));
+        }
+
+        // Evaluate all micro-perturbation candidates in parallel with Rayon
+        let evaluated: Vec<CandidateEvaluation> = candidates
+            .par_iter()
+            .filter_map(|p| evaluate_candidate_plane(mesh, p, config, orig_vol))
+            .collect();
+
+        let best_perturbation = evaluated
+            .into_iter()
+            .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        match best_perturbation {
+            Some(best) if best.score < current_score - 1e-4 => {
+                current_plane = best.plane;
+                current_score = best.score;
+            }
+            _ => break,
+        }
+    }
+
+    current_plane
 }
 
 /// Enforces single contiguous solid guarantee by processing connected components.
@@ -986,8 +1087,25 @@ pub fn optimize_partitions(mesh: &Mesh, config: &OptimizerConfig) -> Optimizatio
             .into_iter()
             .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
 
-        match best_candidate {
+        let best_candidate = match best_candidate {
             Some(best) if best.score < uncut_score - 1e-4 => {
+                let refined_plane = refine_candidate_plane(
+                    &target_mesh,
+                    &best.plane,
+                    best.score,
+                    config,
+                    target_vol,
+                );
+                Some(CandidateEvaluation {
+                    plane: refined_plane,
+                    score: best.score,
+                })
+            }
+            _ => None,
+        };
+
+        match best_candidate {
+            Some(best) => {
                 cuts_made += 1;
                 let (raw_pos, raw_neg) = if let Some(ref pin_cfg) = config.pin_config {
                     if let Ok(cut_res) = slice_mesh_by_plane(&target_mesh, &best.plane) {

@@ -103,6 +103,12 @@ pub fn analyze_support(mesh: &Mesh, config: &SupportConfig) -> SupportMetrics {
 
     let aabb = mesh.aabb();
     let z_bed = aabb.min.z;
+
+    let has_overhang = mesh.triangles.iter().any(|t| is_overhang(t, config, z_bed));
+    if !has_overhang {
+        return SupportMetrics::default();
+    }
+
     let bvh = BVH::build(&mesh.triangles);
 
     mesh.triangles

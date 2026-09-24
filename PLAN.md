@@ -67,3 +67,10 @@ Herramienta de alto rendimiento en Rust para partición inteligente de mallas ST
 - [x] Sistema adaptativo de clavijas: detección de cuadrado inscrito y reducción automática del tamaño de pin (4.0mm a 3.5, 3.0, 2.5, 2.0, 1.5mm) y relajación de margen (hasta 1.0mm) para secciones estrechas.
 - [x] Verificación de piezas cerradas herméticas (watertight), pruebas de integración y telemetría de contigüidad y tamaño de clavija.
 - [x] *Criterio de aceptación:* Cada pieza generada es 1 sólido contiguo único y cerrado, y las clavijas/cajeados se adaptan y generan con precisión dimensional.
+
+### Iteración 8: Máxima Calidad de Búsqueda Exhaustiva y Refinamiento Local (Hill-Climbing)
+- [x] Cuadruplicar el muestreo de cuellos de botella (de 25 a 100 secciones de muestreo a lo largo de X, Y y Z).
+- [x] Exploración angular densa en pasos de 5° en pitch, roll y combinaciones diagonales (hasta ±45°).
+- [x] Refinamiento local fino (Hill-Climbing / Polish): micro-ajustes estocásticos y en gradiente de ±0.5°, ±1.0°, ±2.0° y ±0.1, ±0.25, ±0.5 mm alrededor del plano óptimo para arañar el mínimo global de soporte.
+- [x] Duplicar la densidad de orientaciones candidatas en cama en `src/orient.rs` (de 24 a 48 clústeres planares y micro-inclinaciones).
+- [x] *Criterio de aceptación:* Mayor reducción porcentual de soportes y planos de corte óptimos de precisión milimétrica sin intervención de flags de calidad.
