@@ -2,3 +2,5 @@
 piece_*.stl
 pin_*.stl
 output/
+__pycache__/
+*.pyc
